@@ -25,51 +25,6 @@ DATA_TYPES = {
     'float32' : torch.float32
 }
 
-def modulate (x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Scale and Shift the input tensor"""
-    # TODO: fix later
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-from dataclasses import dataclass
-@dataclass
-class MLPConfig:
-    fan_in : int
-    fan_h : int
-    fan_out : int
-    # non linearity is not optional, if not specified it will be GELU
-    non_linearity : Any = nn.GELU(approximate='tanh')
-    # optional
-    norm_layer : Optional[Any] = None
-    bias : bool = True
-
-
-class MLP (nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.fc1 = nn.Linear (config.fan_in, config.fan_h, bias=config.bias)
-        self.activation = config.non_linearity
-        self.mlp_norm = config.norm_layer if config.norm_layer is not None else nn.Identity()
-        self.fc2 = nn.Linear (config.fan_h, config.fan_out, bias=config.bias)
-
-    def forward (self, x: torch.Tensor)-> torch.Tensor:
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.mlp_norm(x)
-        x = self.fc2(x)
-        return x
-
-# type hints are mere formality, python doesnt enforce types
-def create_norm (norm_type: str, dim: int, eps: float=1e-6)->nn.Module:
-    """Creates a normalization layer based on specified type"""
-    if norm_type == "layernorm":
-        # elementwise_affine = False gives RMSNorm (NoParam Norm: no one cares about that)
-        return nn.LayerNorm (dim, eps=eps, bias=False)
-    else:
-        raise ValueError('Norm Type Not supported!')
-
-
-
 def get_text_encoder_embedding_format(tokenizer_name: str) -> Tuple[int, int]:
     """Returns sequence length and token embedding dimension for text encoder."""
     if tokenizer_name in [
@@ -127,14 +82,14 @@ class UniversalTokenizer:
         which marks padded tokens with 0s"""
         if self.name == "DeepFloyd/t5-v1_1-xxl":
             text_tokens_and_mask = self.tokenizer(captions, padding='max_length', max_length=self.model_max_length, truncation=True, return_attention_mask=True, add_special_tokens=True, return_tensors='pt')
-            mask_and_tokens = {'input_idx': text_tokens_and_mask['input_ids'], 'attention_mask': text_tokens_and_mask['attention_mask']}
+            mask_and_tokens = {'caption_idx': text_tokens_and_mask['input_ids'], 'attention_mask': text_tokens_and_mask['attention_mask']}
             return mask_and_tokens
         
         else:
             # Avoid attention mask for CLIP tokenizers as they are not used
             # the calls usually return a dictionary
             tokenized_caption = self.tokenizer( captions, padding='max_length', max_length=self.tokenizer.model_max_length, truncation=True, return_tensors='pt')
-            return {'input_idx': tokenized_caption['input_ids']}
+            return {'caption_idx': tokenized_caption['caption_idx']}
         
 class UniversalTextEncoder(nn.Module):
     """Universal text encoder supporting multiple model types.
@@ -192,9 +147,9 @@ class openclip_text_encoder (nn.Module):
         self.device = None
         self.weights_dtype = weights_dtype
 
-    def forward_fn (self, text: torch.Tensor)-> Tuple[torch.Tensor, None]:
+    def forward_fn (self, caption_idx: torch.Tensor)-> Tuple[torch.Tensor, None]:
         cast_dtype = self.clip_model.transformer.get_cast_dtype()
-        x = self.clip_model.token_embedding (text).to(cast_dtype) # (B, T, C)
+        x = self.clip_model.token_embedding (caption_idx).to(cast_dtype) # (B, T, C)
         # context length is constant as seq_length as seen in one of the functions above (77)
         # dont need to torch.arange (0, len(x)).to(dtype).to(device)
         x = x + self.clip_model.positional_embedding.to(cast_dtype)
@@ -207,7 +162,8 @@ class openclip_text_encoder (nn.Module):
         x = x.unsqueeze (dim=1) # (B, 1, T, C) expected for text_emb
         return x, None # HF encoders expect to return multiple values with first being text_emb
     
-    def forward (self, text, **kwargs)-> Tuple[torch.Tensor, None]:
+    # eats tokens to give latent clip representation
+    def forward (self, caption_idx, **kwargs)-> Tuple[torch.Tensor, None]:
         with torch.autocast(device_type='cuda', dtype=self.weights_dtype):
-            return self.forward_fn(text)
+            return self.forward_fn(caption_idx)
 
