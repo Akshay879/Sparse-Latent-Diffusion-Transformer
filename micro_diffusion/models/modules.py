@@ -1,5 +1,7 @@
-from typing import Any, Optional
-
+from typing import Any, Optional, Union, Tuple
+from collections.abc import Iterable
+from itertools import repeat
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -206,12 +208,13 @@ class TimeStepEmbedder (nn.Module):
         # thats why we scale down these negative numbers by "half" so that we have smaller negative numbers
         log_freqs = log_freqs / half
         # exponentiate to get freqs
-        freqs = torch.exp (log_freqs)
+        freqs = torch.exp (log_freqs) 
         # note that we resort to exponential scale /decay to ensure wide range of dfs
         # df would be constant in linear scale
 
         sigma_t = sigma_t.unsqueeze(1) #(1, 1)
-        args = sigma_t * freqs
+        args = sigma_t * freqs # (1,1) * (half)
+        # args is now (1, half)
         # embedding vector thats n_t_embd long if n_t_embd is even
         # otherwise its n_t_embd - 1
         embedding = torch.cat((torch.cos(args), torch.sin(args)), dim=-1)
@@ -220,7 +223,7 @@ class TimeStepEmbedder (nn.Module):
             # rectify the dimensionality of the embedding if n_t_embd was odd
             # n_t_embd - 1 -> n_t_embd by appending 0 frequency component
             embedding = torch.cat((embedding, torch.zeros_like(embedding[:, 0])), dim=-1)
-        return embedding
+        return embedding #(1, n_t_embd)
 
     # return type of first parameter in this class
     @property
@@ -230,6 +233,141 @@ class TimeStepEmbedder (nn.Module):
     def forward (self, sigma_t):
         t_embedding = self.embed_timestep (sigma_t, self.n_t_embd).to(self.dtype)
         return self.mlp (t_embedding)
+
+
+def ntuple(n_dim :int, x):
+    """ Converts input into n_dim-tuple. For handling resolutions"""
+    if isinstance(x, Iterable) and not isinstance(x, str):
+        return tuple(x)
+    else:
+        return tuple(repeat(x, n_dim))
+
+def get_2d_sincos_pos_embed (
+        n_embd, 
+        grid_size:Union[int, Tuple[int, int]], 
+        base_size:int=16, 
+        cls_token :bool = False, extra_tokens:int=0,
+        pos_interp_scale = 1.0
+    ):
+        """ One spot / pixel in grid is represented by n_embd channels, n_embd/2 come from scaled x
+            coordinate, n_embd/2 come from scaled y co-ordinate
+        """
+        if isinstance(grid_size, Iterable) and not isinstance(grid_size, str):
+            grid_size = ntuple (2, grid_size)
+        # interpolate position embeddings to adapt model to different resolutions.
+        # makes it so that specific spatial positions have similar embeddings
+        
+        # height is 0, width is 1
+        # division by grid_size[0] makes pos embeddings for different resolutions the same at specific spots
+        # further division by (base_size / pos_interp_scale) mutates the range (say 0 to 16 instead of 0 to 1)
+        # so that model can distinguish better
+        grid_h = np.arange (grid_size[0], dtype=np.float32) / (grid_size[0] / base_size) / pos_interp_scale
+        grid_w = np.arange (grid_size[1], dtype=np.float32) / (grid_size[1] / base_size) / pos_interp_scale
+
+        # width, height
+        grid = np.meshgrid (grid_w, grid_h)
+
+        # stack along axis 0 to get two matrices, first for width co-ordinates second for height co-ordinates
+
+        grid = np.stack (grid, axis=0) # (2, grid_size[1], grid_size[0]) (2, W, H)
+        grid = grid.reshape (2, 1, grid_size[1], grid_size[0]) # add spurious dimension to be processed by get_embedding function
+
+        pos_embedding = get_2d_sinusoidal_embedding_from_grid (n_embd, grid)
+        if cls_token and extra_tokens > 0:
+            pos_embedding = np.concatenate ([np.zeros([extra_tokens, n_embd]), pos_embedding], axis=0)
+        
+        return pos_embedding
+
+def get_2d_sinusoidal_embedding_from_grid (n_embd, grid):
+    "Takes in a grid (2, 1, W, H), generates 2D embedding for the said grid"
+
+    assert n_embd % 2 == 0
+    half_embd = n_embd // 2
+
+    # send x co-ordinates (x) (1, W, H)
+    embd_h = get_1d_sinusoidal_embedding(half_embd, grid[0]) # (HW, half_embd)
+    # send y co-ordinates (y) (1, W, H) 
+    embd_w = get_1d_sinusoidal_embedding(half_embd, grid[1]) # (HW, half_embd)
+    positional_embedding = np.concatenate([embd_h, embd_w], axis = 1) # (HW, n_embd)
+    return positional_embedding 
+
+def get_1d_sinusoidal_embedding (n_embd, pos):
+    """1D sinusoidal embeddings from grid"""
+    assert n_embd % 2 == 0
+
+    omega = np.arange(n_embd//2, dtype=np.float64) # (D/2)
+    omega = omega / (n_embd//2)
+
+    # omega is linearly spaced, to generate exponentially decaying freqs
+    # exponentiate omge to a number thats smaller than 1
+    freqs = (1/10000) ** omega # (D/2)
+    pos = pos.reshape(-1) # (M)
+    # now inject position into these frequencies
+    # first way: if they are tensors
+    # pos.unsqueeze(1) * freqs
+    # second way
+    mutated_freqs = np.einsum('m,d->md', pos, freqs) # (HW=M, D/2)
+
+    sin_embd = np.sin(mutated_freqs)
+    cos_embd = np.cos(mutated_freqs)
+    return np.concatenate ([sin_embd, cos_embd], axis=1)
+
+def get_mask (batch, length, mask_ratio, device):
+    # calculate fraction thats not meant to be masked
+    assert (mask_ratio <= 1.0 and mask_ratio >= 0.0), f"invalid mask ratio"
+
+    keep_ratio = 1 - mask_ratio
+    length_keep = int (keep_ratio * length)
+
+    # sample noise for randomized masking
+    noise = torch.rand (batch, length, device=device) # (B, T)
+    # Find indices that correspond to smaller noise along seq length
+    idx_ascending = torch.argsort (noise, dim = 1) # keep small, remove high
+    # Find indices into idx_asc that yield original noise when indexed into noise
+    # basically noise[idx_asc[idx_restore[0]]] gives the original value at 0 for the sampled noise
+    idx_restore = torch.argsort (idx_ascending, dim = 1)
+    # keep only unmasked indices
+    idx_keep = idx_ascending[:, :length_keep] # (B, input_to_DIT)
+
+    mask = torch.ones (batch, length, device=device)
+    mask[:, :length_keep] = 0
+    # gather mask with respect to the originally smapled random noise to make it random masking
+    mask = torch.gather (mask, dim=1, index=idx_restore)
+
+    return {
+        'mask' : mask,         # (B, T)
+        'idx_keep' : idx_keep, # (B, input_to_DIT=length_keep)
+        'idx_restore' : idx_restore # (B, T)
+    }
+
+def mask_out_token (x, idx_keep):
+    """Mask out tokens specified by idx keep
+        idx_keep (B, length_keep)
+        x (B, T, C)
+    """
+    B, T, C = x.shape
+    # mutate idx_keep to preserve B, T and propagate it along all the n_embd dimensions
+    # idx_keep shape is [n] (n = DIT_in_length = 1- mask_ratio% of input tokens) 
+    gather_index = idx_keep.unsqueeze(-1).repeat(1, 1, C) # repeat (B, length_keep, 1) once along batch, once along T, n_embed times along C
+    x_masked = torch.gather (x, dim=1, index=gather_index) # gather_index (B, length_keep, C)
+    # x_masked will be B, DIT_in_length, C, which will be input to our DIT
+
+    return x_masked
+
+def insert_filler_masked_tokens(x:torch.Tensor, stub_token:torch.Tensor, idx_restore:torch.Tensor):
+    """
+        x -> B, keep_length, C
+        filler_mask_token -> 1, 1, C just a stub
+        idx_restore -> B, T (which indices to index into to get a sequence that respects original noise
+        which we sorted and selected first keep_length indices)
+    """
+    masked_out_length = idx_restore.shape[1]-x.shape[1] # the tokens that DIT doesnt even see, 75% of og tokens
+    filler_mask_tokens = stub_token.repeat (x.shape[0], masked_out_length, 1)
+    
+    x_og_kappa = torch.cat ((x, filler_mask_tokens), dim=1)
+    restore_gather_index = idx_restore.unsqueeze(-1).repeat(1, 1, x.shape[-1])
+    x_og_kappa = torch.gather (x_og_kappa, dim=1, index=restore_gather_index)
+    return x_og_kappa
 
 
 class MLP (nn.Module):
