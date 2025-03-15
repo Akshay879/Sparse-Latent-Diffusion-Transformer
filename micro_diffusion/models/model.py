@@ -88,7 +88,8 @@ class LatentDiffusion (ComposerModel):
         self.eval_mask_ratio = 0 # no masking during inference/sampling/evaluation
         assert self.train_mask_ratio >= 0, f"Masking ratio has to be non negative"
 
-        self.latent_scale = self.vae.config.scaling_factor
+        if self.vae is not None:
+            self.latent_scale = self.vae.config.scaling_factor
 
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
@@ -96,12 +97,14 @@ class LatentDiffusion (ComposerModel):
         # Freeze vae and text_encoder
         if self.text_encoder is not None:
             self.text_encoder.requires_grad_(False)
-        self.vae.requires_grad_ (False)
+        if self.vae is not None:            
+            self.vae.requires_grad_ (False)
 
         # dont FSDP wrap frozen models
         if self.text_encoder is not None:
             self.text_encoder._fsdp_wrap = False
-        self.vae._fsdp_wrap = False
+        if self.vae is not None:            
+            self.vae._fsdp_wrap = False
         self.dit._fsdp_wrap = True
 
     
@@ -187,7 +190,7 @@ class LatentDiffusion (ComposerModel):
         out = model_forward_fxn (
             (c_in * x).to(x.dtype),
             c_noise.flatten(), # TODO: introspect later (B)
-            y, # text caption?
+            y, # text caption
             mask_ratio=mask_ratio, 
             **kwargs
         )
@@ -406,6 +409,7 @@ class LatentDiffusion (ComposerModel):
         else:
             text_embeddings = latent_prompt
 
+        # xT
         latents = torch.randn (
             (len(text_embeddings), self.dit.in_channels, self.latent_res, self.latent_res),
             device = device,
@@ -434,7 +438,7 @@ class LatentDiffusion (ComposerModel):
     
 
 def create_latent_diffusion (
-        vae_name: str = 'stabilityai/stable-diffusion-xl-base-1.0',
+        vae_name: str = None, #'stabilityai/stable-diffusion-xl-base-1.0',
         text_encoder_name: str = None, #'openclip:hf-hub:apple/DFN5B-CLIP-ViT-H-14-378',
         dit_arch: str = "MicroDiT_XL",
         latent_res: int = 32,
@@ -460,12 +464,14 @@ def create_latent_diffusion (
         pos_interp_scale = pos_interp_scale,
         in_channels=in_channels
     )
-        
-    vae = AutoencoderKL.from_pretrained (vae_name, subfolder= None if vae_name=='ostris/vae-kl-f8-d16' else 'vae', torch_dtype=DATA_TYPES[dtype], pretrained=True)
+    
+    if vae_name is not None:
+        vae = AutoencoderKL.from_pretrained (vae_name, subfolder= None if vae_name=='ostris/vae-kl-f8-d16' else 'vae', torch_dtype=DATA_TYPES[dtype], pretrained=True)
     if text_encoder_name is not None:
         tokenizer = UniversalTokenizer (text_encoder_name)
         text_encoder = UniversalTextEncoder (text_encoder_name, weights_dtype=dtype, pretrained=True)
     else:
+        vae = None
         tokenizer = None
         text_encoder = None
     

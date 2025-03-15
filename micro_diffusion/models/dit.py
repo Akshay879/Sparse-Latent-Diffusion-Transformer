@@ -369,7 +369,6 @@ class DiT(nn.Module):
             is_moe_block = [
                 True if i in expert_blocks_idx else False for i in range (patch_mixer_depth)
             ]
-
             # Patch Mixer
             self.patch_mixer = nn.ModuleList([
                 DiTBlock (
@@ -477,7 +476,6 @@ class DiT(nn.Module):
         expert_blocks_idx = [i for i in range(depth-1) if i % experts_every_n != 0]
         # list looks like (Dense, Sparse, .... Dense, Dense)
         is_moe_block = [ (True if i in expert_blocks_idx else False) for i in range(depth)]
-
         self.backbone = nn.ModuleList([
             DiTBlock (
                 n_embd=n_embd,
@@ -571,7 +569,7 @@ class DiT(nn.Module):
         mask = None
         if mask_ratio > 0:
             mask_dict = get_mask(
-                x.shape[0], x.shape[1], device=x.device
+                x.shape[0], x.shape[1], mask_ratio=mask_ratio, device=x.device
             )
             idx_keep = mask_dict['idx_keep'] # (B, 0.25T)
             idx_restore = mask_dict['idx_restore'] # (B, T)
@@ -644,6 +642,7 @@ class DiT(nn.Module):
         net_out = cfg * cond_out - (cfg - 1) * uncond_out
         return {"sample" : net_out}
     
+    # only called in inference
     def forward (
             self,
             x:torch.Tensor,
@@ -655,10 +654,9 @@ class DiT(nn.Module):
         """Call appropriate forward pass based on classifier-free guidance value."""
 
         if cfg != 1.0:
-            # only called in EDM sampler loop
             return self.forward_with_cfg(x, sigma_t, c, cfg, **kwargs)
         else:
-            # only called in inference
+           
             return self.forward_without_cfg(x, sigma_t, c, **kwargs)
 
     def initialize_weights(self):
